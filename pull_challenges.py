@@ -40,7 +40,7 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, lik
 # ---------------------------------------------------------------------------
 
 def token_headers(token: str) -> dict:
-    return {"User-Agent": USER_AGENT, "Authorization": f"Token {token}"}
+    return {"User-Agent": USER_AGENT, "Authorization": f"Token {token}", "Content-Type": "application/json"}
 
 
 async def login_password(session: aiohttp.ClientSession, base_url: str, username: str, password: str) -> bool:
@@ -109,7 +109,7 @@ async def fetch_bytes(session: aiohttp.ClientSession, url: str, extra_headers: O
     headers = {"User-Agent": USER_AGENT}
     if extra_headers:
         headers.update(extra_headers)
-    async with session.get(url, headers=headers, allow_redirects=False) as resp:
+    async with session.get(url, headers=headers, allow_redirects=True) as resp:
         if resp.status != 200:
             return None
         return io.BytesIO(await resp.read())
@@ -132,7 +132,7 @@ def html_to_markdown(html: Optional[str]) -> str:
 def slugify(name: str) -> str:
     """Convert a challenge name to a lowercase hyphenated slug."""
     slug = name.lower().strip()
-    slug = re.sub(r'[<>:"/\\|?*.\x00-\x1f]', "", slug)
+    slug = re.sub(r'[<>:"/\\|?*.\x00-\x1f\[\]]', "", slug)
     slug = re.sub(r"[\s_]+", "-", slug)
     slug = re.sub(r"-+", "-", slug).strip("-")
     return slug or "challenge"

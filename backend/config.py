@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     azure_openai_api_key: str = ""
     opencode_zen_api_key: str = ""
 
+    # 9Router (Local OpenAI-compatible proxy)
+    router_endpoint: str = "http://127.0.0.1:20128/v1"
+    router_api_key: str = ""
+
     # Infra
     sandbox_image: str = "ctf-sandbox"
     max_concurrent_challenges: int = 10

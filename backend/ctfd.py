@@ -204,7 +204,7 @@ class CTFdClient:
 
         name = challenge.get("name", f"challenge-{challenge['id']}")
         # Slugify
-        slug = re.sub(r'[<>:"/\\|?*.\x00-\x1f]', "", name.lower().strip())
+        slug = re.sub(r'[<>:"/\\|?*.\x00-\x1f\[\]]', "", name.lower().strip())
         slug = re.sub(r"[\s_]+", "-", slug)
         slug = re.sub(r"-+", "-", slug).strip("-") or "challenge"
 

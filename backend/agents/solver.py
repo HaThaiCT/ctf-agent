@@ -198,7 +198,6 @@ class Solver:
         assert self._agent is not None
 
         t0 = time.monotonic()
-        steps_before = self._step_count[0]
 
         try:
             from pydantic_ai.usage import UsageLimits
@@ -210,7 +209,7 @@ class Solver:
             )
 
             duration = time.monotonic() - t0
-            usage = result.usage()
+            usage = result.usage() if callable(result.usage) else result.usage
 
             self.cost_tracker.record(
                 self.agent_name, usage, self.model_id,
@@ -262,6 +261,10 @@ class Solver:
             logger.error(f"[{self.agent_name}] Error: {e}", exc_info=True)
             self._findings = f"Error: {e}"
             self.tracer.event("error", error=str(e))
+            if self.deps.confirmed_flag:
+                self._confirmed = True
+                self._flag = self._flag or self.deps.confirmed_flag
+                return self._result(FLAG_FOUND)
             return self._result(ERROR)
 
     def bump(self, insights: str) -> None:

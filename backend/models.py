@@ -8,7 +8,7 @@ import boto3
 from pydantic_ai.models import Model
 from pydantic_ai.models.bedrock import BedrockConverseModel, BedrockModelSettings
 from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
-from pydantic_ai.models.openai import OpenAIModel, OpenAIModelSettings
+from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.bedrock import BedrockProvider
 from pydantic_ai.providers.google import GoogleProvider
 from pydantic_ai.providers.openai import OpenAIProvider
@@ -17,13 +17,11 @@ from pydantic_ai.settings import ModelSettings
 if TYPE_CHECKING:
     from backend.config import Settings
 
-# Default model specs — claude-sdk and codex providers use the new solver backends
+# Default model specs — configured to use local 9Router
 DEFAULT_MODELS: list[str] = [
-    "claude-sdk/claude-opus-4-6/medium",
-    "claude-sdk/claude-opus-4-6/max",
-    "codex/gpt-5.4",
-    "codex/gpt-5.4-mini",
-    "codex/gpt-5.3-codex",
+    "router/ag/gemini-3.8-flash:high",
+    "router/cmc/deepseek/deepseek-v4-flash:xhigh",
+    "router/cx/gpt-6-sol:high",
 ]
 
 # Context window sizes (tokens)
@@ -44,6 +42,8 @@ VISION_MODELS: set[str] = {
     "gpt-5.4",
     "gpt-5.4-mini",
     "gemini-3-flash-preview",
+    "ag/gemini-3.8-flash",
+    "cx/gpt-6-sol",
 }
 
 
@@ -68,8 +68,20 @@ def resolve_model(spec: str, settings: Settings) -> Model:
                     model_id,
                     provider=BedrockProvider(bedrock_client=client),
                 )
+        case "router":
+            endpoint = getattr(settings, "router_endpoint", "") or "http://127.0.0.1:20128/v1"
+            api_key = settings.router_api_key
+            if not api_key:
+                raise ValueError("ROUTER_API_KEY must be set to use 9Router models")
+            return OpenAIChatModel(
+                model_id,
+                provider=OpenAIProvider(
+                    base_url=endpoint,
+                    api_key=api_key,
+                ),
+            )
         case "azure":
-            return OpenAIModel(
+            return OpenAIChatModel(
                 model_id,
                 provider=OpenAIProvider(
                     base_url=settings.azure_openai_endpoint,
@@ -77,7 +89,7 @@ def resolve_model(spec: str, settings: Settings) -> Model:
                 ),
             )
         case "zen":
-            return OpenAIModel(
+            return OpenAIChatModel(
                 model_id,
                 provider=OpenAIProvider(
                     base_url="https://opencode.ai/zen/v1",
@@ -100,8 +112,14 @@ def resolve_model(spec: str, settings: Settings) -> Model:
 
 def resolve_model_settings(spec: str) -> ModelSettings:
     """Get provider-specific model settings with caching enabled."""
-    provider = spec.split("/", 1)[0]
+    provider = provider_from_spec(spec)
     match provider:
+        case "router":
+            effort = effort_from_spec(spec)
+            kwargs: dict[str, object] = {"max_tokens": 128_000}
+            if effort:
+                kwargs["thinking"] = effort
+            return ModelSettings(**kwargs)
         case "bedrock":
             return BedrockModelSettings(
                 max_tokens=128_000,
@@ -113,7 +131,7 @@ def resolve_model_settings(spec: str) -> ModelSettings:
             # Azure/Zen use OpenAI chat completions — server-side prompt caching
             # is automatic, no explicit config needed. Set max_tokens to avoid
             # reserving the full context window.
-            return OpenAIModelSettings(
+            return ModelSettings(
                 max_tokens=128_000,
             )
         case "google":
@@ -129,21 +147,40 @@ def resolve_model_settings(spec: str) -> ModelSettings:
 
 
 def model_id_from_spec(spec: str) -> str:
-    """Extract just the model ID from a spec (strips effort suffix)."""
+    """Extract just the model ID from a spec (strips provider prefix and effort suffix)."""
+    valid_efforts = ("minimal", "low", "medium", "high", "max", "xhigh")
+    if spec.startswith("router/"):
+        raw = spec[len("router/"):]
+        if ":" in raw:
+            base, effort = raw.rsplit(":", 1)
+            if effort in valid_efforts:
+                return base
+        parts = raw.split("/")
+        if len(parts) > 1 and parts[-1] in valid_efforts:
+            return "/".join(parts[:-1])
+        return raw
+
     parts = spec.split("/")
     return parts[1] if len(parts) >= 2 else spec
 
 
 def provider_from_spec(spec: str) -> str:
     """Extract the provider from a spec."""
+    if spec.startswith("router/"):
+        return "router"
     return spec.split("/", 1)[0]
 
 
 def effort_from_spec(spec: str) -> str | None:
-    """Extract effort level from a spec like 'claude-sdk/claude-opus-4-6/max'."""
+    """Extract effort level from a spec like 'claude-sdk/claude-opus-4-6/max' or 'router/cx/gpt-6-sol:high'."""
+    valid_efforts = ("minimal", "low", "medium", "high", "max", "xhigh")
+    if ":" in spec:
+        effort = spec.rsplit(":", 1)[1]
+        if effort in valid_efforts:
+            return effort
     parts = spec.split("/")
-    if len(parts) >= 3 and parts[2] in ("low", "medium", "high", "max"):
-        return parts[2]
+    if len(parts) >= 3 and parts[-1] in valid_efforts:
+        return parts[-1]
     return None
 
 

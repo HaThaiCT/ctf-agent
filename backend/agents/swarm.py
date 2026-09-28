@@ -186,6 +186,7 @@ class ChallengeSwarm:
             display, is_confirmed = await do_submit_flag(self.ctfd, self.meta.name, flag)
             if is_confirmed:
                 self.confirmed_flag = normalized
+                self.cancel_event.set()
             else:
                 self._submit_count[model_spec] = wrong_count + 1
                 self._last_submit_time[model_spec] = time.monotonic()
@@ -226,8 +227,11 @@ class ChallengeSwarm:
                 self.findings[model_spec] = result.findings_summary
                 await self.message_bus.post(model_spec, result.findings_summary[:500])
 
-            if result.status == FLAG_FOUND:
+            if result.status == FLAG_FOUND or self.confirmed_flag:
                 self.cancel_event.set()
+                if not result.flag and self.confirmed_flag:
+                    result.flag = self.confirmed_flag
+                    result.status = FLAG_FOUND
                 self.winner = result
                 logger.info(
                     f"[{self.meta.name}] Flag found by {model_spec}: {result.flag}"
