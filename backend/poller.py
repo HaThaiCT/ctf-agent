@@ -1,4 +1,4 @@
-"""Background CTFd poller — detects new and solved challenges every 5 seconds."""
+"""Background CTFd poller — detects new and solved challenges every 30 seconds."""
 
 import asyncio
 import logging
@@ -22,7 +22,7 @@ class CTFdPoller:
     """Polls CTFd every interval_s seconds, emits events for new/solved challenges."""
 
     ctfd: CTFdClient
-    interval_s: float = 5.0
+    interval_s: float = 30.0
     on_solved: Callable[[str], None] | None = None
 
     _known_challenges: set[str] = field(default_factory=set)

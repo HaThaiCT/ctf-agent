@@ -94,7 +94,7 @@ async def run_event_loop(
 
     poller = CTFdPoller(
         ctfd=ctfd,
-        interval_s=5.0,
+        interval_s=30.0,
         on_solved=lambda name: mark_challenge_solved(deps, name),
     )
     await poller.start()

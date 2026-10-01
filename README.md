@@ -21,7 +21,7 @@ Theo thông tin của dự án, công cụ đã giải 52/52 challenge và đạ
 ## Cách hệ thống hoạt động
 
 ```text
-CTFd ──> bộ thăm dò (mỗi 5 giây) ──> coordinator (Claude SDK hoặc Codex)
+CTFd ──> bộ thăm dò (mỗi 30 giây) ──> coordinator (Claude SDK hoặc Codex)
                                          │
                                          ├── swarm / challenge A
                                          │     ├── solver cấu hình 1 ──> Docker riêng
@@ -33,7 +33,7 @@ CTFd ──> bộ thăm dò (mỗi 5 giây) ──> coordinator (Claude SDK ho�
 - Coordinator là **AI agent**, không phải chỉ là logic Python cố định. Backend vẫn đảm nhiệm thăm dò CTFd, tải challenge, quản lý vòng đời swarm, container, trace và việc gửi flag. `--coordinator claude` dùng Claude Agent SDK; `--coordinator codex` dùng Codex app-server.
 - Một swarm chạy một solver cho mỗi **cấu hình** `--models` đã chọn; có thể dùng hai mức effort của cùng một model để có hai solver riêng. Các solver cùng challenge chia sẻ phát hiện qua `ChallengeMessageBus` và các lượt thử tiếp theo có thể dùng thông tin từ solver khác. Với **một** cấu hình, sẽ không có phát hiện từ solver khác để trao đổi.
 - Dữ liệu challenge nằm trong `metadata.yml` và thư mục `distfiles/`. Container gắn metadata và distfiles dạng chỉ đọc tại `/challenge/`, còn `/challenge/workspace/` dành cho file làm việc. Claude SDK solver dùng Claude Code/Agent SDK làm agent harness; hook chuyển lệnh Bash vào container. Các backend solver khác gồm Codex và Pydantic AI cho một số provider API.
-- Khi gửi flag thật, backend xử lý chống gửi trùng và thời gian chờ sau những lần gửi sai. Khi CTFd xác nhận `correct`/`already_solved` — kể cả do thành viên cùng đội nộp ngoài công cụ — backend hủy các solver của challenge, đợi đóng tiến trình agent và xóa container/workspace rồi mới nhả slot cho challenge đang chờ. Poller phát hiện lần nộp ngoài trong tối đa khoảng một chu kỳ 5 giây. Nếu Docker từ chối xóa container, slot được giữ lại và lỗi được ghi log thay vì cấp quá tài nguyên. `--no-submit` tắt việc gửi flag lên CTFd; kết quả model trong chế độ này **không phải xác nhận từ CTFd**.
+- Khi gửi flag thật, backend xử lý chống gửi trùng và thời gian chờ sau những lần gửi sai. Khi CTFd xác nhận `correct`/`already_solved` — kể cả do thành viên cùng đội nộp ngoài công cụ — backend hủy các solver của challenge, đợi đóng tiến trình agent và xóa container/workspace rồi mới nhả slot cho challenge đang chờ. Poller phát hiện lần nộp ngoài trong tối đa khoảng một chu kỳ 30 giây. Nếu Docker từ chối xóa container, slot được giữ lại và lỗi được ghi log thay vì cấp quá tài nguyên. `--no-submit` tắt việc gửi flag lên CTFd; kết quả model trong chế độ này **không phải xác nhận từ CTFd**.
 
 ## Yêu cầu trước khi cài
 
