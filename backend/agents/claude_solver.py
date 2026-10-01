@@ -23,6 +23,7 @@ from claude_agent_sdk import (
     TextBlock,
 )
 
+from backend.config import Settings
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.loop_detect import LoopDetector
@@ -46,7 +47,7 @@ class ClaudeSolver:
         meta: ChallengeMeta,
         ctfd: CTFdClient,
         cost_tracker: CostTracker,
-        settings: object,
+        settings: Settings,
         cancel_event: asyncio.Event | None = None,
         no_submit: bool = False,
         submit_fn=None,
@@ -72,8 +73,8 @@ class ClaudeSolver:
             memory_limit=getattr(settings, "container_memory_limit", "4g"),
         )
         self.loop_detector = LoopDetector()
-        self.tracer = SolverTracer(meta.name, self.model_id)
-        self.agent_name = f"{meta.name}/{self.model_id}"
+        self.tracer = SolverTracer(meta.name, self.model_spec)
+        self.agent_name = f"{meta.name}/{self.model_spec}"
 
         self._client: ClaudeSDKClient | None = None
         self._session_id: str | None = None
@@ -103,7 +104,9 @@ class ClaudeSolver:
             "submit_flag 'FLAG' to submit. notify_coordinator 'MSG' to message the coordinator.\n\n"
         )
         system_prompt = sandbox_preamble + build_prompt(
-            self.meta, distfile_names, container_arch=container_arch,
+            self.meta,
+            distfile_names,
+            container_arch=container_arch,
             has_named_tools=False,
         )
 
@@ -139,6 +142,7 @@ class ClaudeSolver:
             warn_msg = ""
             if loop_status == "warn":
                 from backend.loop_detect import LOOP_WARNING_MESSAGE
+
                 warn_msg = LOOP_WARNING_MESSAGE
 
             if tool_name == "Bash":
@@ -155,12 +159,17 @@ class ClaudeSolver:
                             display, confirmed = await self.submit_fn(flag_val)
                         else:
                             from backend.tools.core import do_submit_flag
-                            display, confirmed = await do_submit_flag(self.ctfd, self.meta.name, flag_val)
+
+                            display, confirmed = await do_submit_flag(
+                                self.ctfd, self.meta.name, flag_val
+                            )
                         result_msg = display
                         if confirmed:
                             self._confirmed = True
                             self._flag = flag_val
-                            self.tracer.event("flag_confirmed", flag=flag_val, step=self._step_count)
+                            self.tracer.event(
+                                "flag_confirmed", flag=flag_val, step=self._step_count
+                            )
                     # Rewrite to an echo so Bash returns the submission result
                     return {
                         "hookSpecificOutput": {
@@ -174,7 +183,9 @@ class ClaudeSolver:
                     }
 
                 # Intercept notify_coordinator commands
-                notify_match = re.match(r"notify_coordinator\s+['\"]?(.+?)['\"]?\s*$", command.strip())
+                notify_match = re.match(
+                    r"notify_coordinator\s+['\"]?(.+?)['\"]?\s*$", command.strip()
+                )
                 if notify_match and self.notify_coordinator:
                     msg = notify_match.group(1).strip()
                     await self.notify_coordinator(msg)
@@ -182,7 +193,10 @@ class ClaudeSolver:
                         "hookSpecificOutput": {
                             "hookEventName": "PreToolUse",
                             "permissionDecision": "allow",
-                            "updatedInput": {**tool_input, "command": "echo 'Message sent to coordinator.'"},
+                            "updatedInput": {
+                                **tool_input,
+                                "command": "echo 'Message sent to coordinator.'",
+                            },
                         }
                     }
 
@@ -212,12 +226,16 @@ class ClaudeSolver:
             # The model should use find/grep/cat/tee via bash instead.
             redirect_hint = ""
             if tool_name in ("Glob", "Grep"):
-                redirect_hint = " Use `find` or `grep` via bash instead — those run in the container."
+                redirect_hint = (
+                    " Use `find` or `grep` via bash instead — those run in the container."
+                )
             elif tool_name in ("Read", "Write", "Edit", "NotebookEdit"):
                 redirect_hint = " Use cat/head/tail to read, and tee/cat>file to write via bash."
 
             return {
-                "systemMessage": f"{tool_name} is not available — all work happens inside the Docker container.{redirect_hint}" if redirect_hint else "",
+                "systemMessage": f"{tool_name} is not available — all work happens inside the Docker container.{redirect_hint}"
+                if redirect_hint
+                else "",
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
                     "permissionDecision": "deny",
@@ -236,10 +254,13 @@ class ClaudeSolver:
             if input_data.get("hook_event_name") != "PostToolUse":
                 return {}
             response_str = str(input_data.get("tool_response", ""))[:2000]
-            self.tracer.tool_result(input_data.get("tool_name", "?"), response_str[:500], self._step_count)
+            self.tracer.tool_result(
+                input_data.get("tool_name", "?"), response_str[:500], self._step_count
+            )
 
             if self._step_count % 5 == 0 and self.message_bus:
                 from backend.tools.core import do_check_findings
+
                 findings = await do_check_findings(self.message_bus, self.model_spec)
                 if findings and "No new findings" not in findings:
                     return {
@@ -251,14 +272,18 @@ class ClaudeSolver:
             return {}
 
         from backend.models import effort_from_spec
+
         effort = effort_from_spec(self.model_spec)
 
+        # Each solver launches its own CLI subprocess. Only an explicit
+        # solver-router override changes the inherited Claude Code gateway.
+        solver_env = self.settings.solver_sdk_env()
         options = ClaudeAgentOptions(
             model=self.model_id,
             system_prompt=system_prompt,
             effort=effort,
             # Clear CLAUDECODE to prevent nested-session rejection when run from coordinator
-            env={"CLAUDECODE": ""},
+            env={"CLAUDECODE": "", **solver_env},
             allowed_tools=["Bash", "WebFetch", "WebSearch"],
             permission_mode="bypassPermissions",
             output_format={"type": "json_schema", "schema": solver_output_json_schema()},
@@ -318,23 +343,29 @@ class ClaudeSolver:
                     if not isinstance(msg_usage, dict):
                         msg_usage = vars(msg_usage) if hasattr(msg_usage, "__dict__") else {}
                     self.cost_tracker.record_tokens(
-                        self.agent_name, self.model_id,
+                        self.agent_name,
+                        self.model_id,
                         input_tokens=msg_usage.get("input_tokens", 0),
                         output_tokens=msg_usage.get("output_tokens", 0),
-                        cache_read_tokens=msg_usage.get("cache_read_input_tokens", msg_usage.get("cache_read_tokens", 0)),
+                        cache_read_tokens=msg_usage.get(
+                            "cache_read_input_tokens", msg_usage.get("cache_read_tokens", 0)
+                        ),
                         provider_spec="claude-sdk",
                         duration_seconds=time.monotonic() - t0,
                     )
 
                     output = getattr(message, "structured_output", None)
-                    if output:
-                        if output.get("type") == "flag_found":
-                            self._flag = output.get("flag")
-                            self._findings = f"Flag found via {output.get('method', '?')}: {self._flag}"
-                            if self.no_submit:
-                                self._confirmed = True
+                    if output and output.get("type") == "flag_found":
+                        self._flag = output.get("flag")
+                        self._findings = f"Flag found via {output.get('method', '?')}: {self._flag}"
+                        if self.no_submit:
+                            self._confirmed = True
 
-            self.tracer.event("turn_complete", duration=round(time.monotonic() - t0, 1), cost=round(self._cost_usd, 4))
+            self.tracer.event(
+                "turn_complete",
+                duration=round(time.monotonic() - t0, 1),
+                cost=round(self._cost_usd, 4),
+            )
 
             # Also check if flag was confirmed via submit_flag in bash
             if self._confirmed and self._flag:
@@ -351,7 +382,11 @@ class ClaudeSolver:
             logger.error(f"[{self.agent_name}] Error: {e}", exc_info=True)
             self._findings = f"Error: {e}"
             self.tracer.event("error", error=error_str)
-            if "quota" in error_str.lower() or "rate" in error_str.lower() or "overloaded" in error_str.lower():
+            if (
+                "quota" in error_str.lower()
+                or "rate" in error_str.lower()
+                or "overloaded" in error_str.lower()
+            ):
                 return self._result(QUOTA_ERROR)
             return self._result(ERROR)
 
@@ -361,11 +396,20 @@ class ClaudeSolver:
         self.tracer.event("bump", insights=insights[:500])
         logger.info(f"[{self.agent_name}] Bumped with insights (session {self._session_id})")
 
-    def _result(self, status: str, run_steps: int | None = None, run_cost: float | None = None) -> SolverResult:
-        self.tracer.event("finish", status=status, flag=self._flag, confirmed=self._confirmed, cost_usd=round(self._cost_usd, 4))
+    def _result(
+        self, status: str, run_steps: int | None = None, run_cost: float | None = None
+    ) -> SolverResult:
+        self.tracer.event(
+            "finish",
+            status=status,
+            flag=self._flag,
+            confirmed=self._confirmed,
+            cost_usd=round(self._cost_usd, 4),
+        )
         # Use per-run metrics if provided, so broken-solver detection works across bumps
         return SolverResult(
-            flag=self._flag, status=status,
+            flag=self._flag,
+            status=status,
             findings_summary=self._findings[:2000],
             step_count=run_steps if run_steps is not None else self._step_count,
             cost_usd=run_cost if run_cost is not None else self._cost_usd,
@@ -375,11 +419,10 @@ class ClaudeSolver:
     async def stop(self) -> None:
         self.tracer.event("stop", step_count=self._step_count)
         self.tracer.close()
-        if self._client:
-            try:
+        try:
+            if self._client:
                 await self._client.__aexit__(None, None, None)
-            except Exception:
-                pass
-            self._client = None
-        if self.sandbox:
-            await self.sandbox.stop()
+                self._client = None
+        finally:
+            if self.sandbox:
+                await self.sandbox.stop()

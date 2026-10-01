@@ -11,7 +11,6 @@ import click
 from rich.console import Console
 
 from backend.config import Settings
-from backend.models import DEFAULT_MODELS
 
 console = Console()
 
@@ -24,7 +23,9 @@ def _setup_logging(verbose: bool = False) -> None:
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("aiodocker").setLevel(logging.WARNING)
     handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)-8s %(message)s", datefmt="%X"))
+    handler.setFormatter(
+        logging.Formatter("[%(asctime)s] %(levelname)-8s %(message)s", datefmt="%X")
+    )
     logging.basicConfig(level=level, handlers=[handler], force=True)
 
 
@@ -36,8 +37,15 @@ def _setup_logging(verbose: bool = False) -> None:
 @click.option("--challenge", default=None, help="Solve a single challenge directory")
 @click.option("--challenges-dir", default="challenges", help="Directory for challenge files")
 @click.option("--no-submit", is_flag=True, help="Dry run — don't submit flags")
-@click.option("--coordinator-model", default=None, help="Model for coordinator (default: claude-opus-4-6)")
-@click.option("--coordinator", default="claude", type=click.Choice(["claude", "codex"]), help="Coordinator backend")
+@click.option(
+    "--coordinator-model", default=None, help="Model for coordinator (default: claude-opus-4-6)"
+)
+@click.option(
+    "--coordinator",
+    default="claude",
+    type=click.Choice(["claude", "codex"]),
+    help="Coordinator backend",
+)
 @click.option("--max-challenges", default=10, type=int, help="Max challenges solved concurrently")
 @click.option("--msg-port", default=0, type=int, help="Operator message port (0 = auto)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose logging")
@@ -68,7 +76,7 @@ def main(
         settings.ctfd_token = ctfd_token
     settings.max_concurrent_challenges = max_challenges
 
-    model_specs = list(models) if models else list(DEFAULT_MODELS)
+    model_specs = settings.selected_solver_models(models)
 
     console.print("[bold]CTF Agent v2[/bold]")
     console.print(f"  CTFd: {settings.ctfd_url}")
@@ -80,7 +88,18 @@ def main(
     if challenge:
         asyncio.run(_run_single(settings, challenge, model_specs, no_submit, max_challenges))
     else:
-        asyncio.run(_run_coordinator(settings, model_specs, challenges_dir, no_submit, coordinator_model, coordinator, max_challenges, msg_port))
+        asyncio.run(
+            _run_coordinator(
+                settings,
+                model_specs,
+                challenges_dir,
+                no_submit,
+                coordinator_model,
+                coordinator,
+                max_challenges,
+                msg_port,
+            )
+        )
 
 
 async def _run_single(
@@ -128,9 +147,25 @@ async def _run_single(
         no_submit=no_submit,
     )
 
+    from backend.poller import CTFdPoller
+
+    poller = None
     try:
+        if not no_submit and (
+            settings.ctfd_token or (settings.ctfd_user != "admin" and settings.ctfd_pass != "admin")
+        ):
+            poller = CTFdPoller(
+                ctfd=ctfd, on_solved=lambda name: swarm.kill() if name == meta.name else None
+            )
+            await poller.start()
+            if meta.name in poller.known_solved:
+                console.print(
+                    "[green]Challenge already solved on CTFd; no solvers started.[/green]"
+                )
+                return
         result = await swarm.run()
         from backend.solver_base import FLAG_FOUND
+
         if result and result.status == FLAG_FOUND:
             console.print(f"\n[bold green]FLAG FOUND:[/bold green] {result.flag}")
         else:
@@ -141,6 +176,8 @@ async def _run_single(
             console.print(f"  {agent_name}: {cost_tracker.format_usage(agent_name)}")
         console.print(f"  [bold]Total: ${cost_tracker.total_cost_usd:.2f}[/bold]")
     finally:
+        if poller:
+            await poller.stop()
         await ctfd.close()
 
 
@@ -164,6 +201,7 @@ async def _run_coordinator(
 
     if coordinator_backend == "codex":
         from backend.agents.codex_coordinator import run_codex_coordinator
+
         results = await run_codex_coordinator(
             settings=settings,
             model_specs=model_specs,
@@ -174,6 +212,7 @@ async def _run_coordinator(
         )
     else:
         from backend.agents.claude_coordinator import run_claude_coordinator
+
         results = await run_claude_coordinator(
             settings=settings,
             model_specs=model_specs,

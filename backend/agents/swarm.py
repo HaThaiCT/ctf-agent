@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Coroutine
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 from backend.agents.solver import Solver
 from backend.cost_tracker import CostTracker
@@ -64,8 +65,14 @@ class ChallengeSwarm:
     _flag_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _submit_count: dict[str, int] = field(default_factory=dict)  # per-model wrong submission count
     _submitted_flags: set[str] = field(default_factory=set)  # dedup exact flags
-    _last_submit_time: dict[str, float] = field(default_factory=dict)  # per-model last submit timestamp
+    _last_submit_time: dict[str, float] = field(
+        default_factory=dict
+    )  # per-model last submit timestamp
     message_bus: ChallengeMessageBus = field(default_factory=ChallengeMessageBus)
+    _solver_tasks: set[asyncio.Task] = field(default_factory=set, repr=False)
+    _stopping_tasks: set[asyncio.Task] = field(default_factory=set, repr=False)
+    _confirmed_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    _confirmed_result: SolverResult | None = field(default=None, repr=False)
 
     def _create_solver(self, model_spec: str):
         """Create the right solver type based on provider.
@@ -76,11 +83,14 @@ class ChallengeSwarm:
         """
         provider = provider_from_spec(model_spec)
 
-        def _submit_fn(flag): return self.try_submit_flag(flag, model_spec)
+        def _submit_fn(flag):
+            return self.try_submit_flag(flag, model_spec)
+
         _notify = self._make_notify_fn(model_spec)
 
         if provider == "claude-sdk":
             from backend.agents.claude_solver import ClaudeSolver
+
             return ClaudeSolver(
                 model_spec=model_spec,
                 challenge_dir=self.challenge_dir,
@@ -97,6 +107,7 @@ class ChallengeSwarm:
 
         if provider == "codex":
             from backend.agents.codex_solver import CodexSolver
+
             return CodexSolver(
                 model_spec=model_spec,
                 challenge_dir=self.challenge_dir,
@@ -115,14 +126,16 @@ class ChallengeSwarm:
 
     def _make_notify_fn(self, model_spec: str):
         """Create a callback that pushes solver messages to the coordinator inbox."""
+
         async def _notify(message: str) -> None:
             if self.coordinator_inbox:
-                self.coordinator_inbox.put_nowait(
-                    f"[{self.meta.name}/{model_spec}] {message}"
-                )
+                self.coordinator_inbox.put_nowait(f"[{self.meta.name}/{model_spec}] {message}")
+
         return _notify
 
-    def _create_pydantic_solver(self, model_spec: str, sandbox=None, owns_sandbox: bool | None = None) -> Solver:
+    def _create_pydantic_solver(
+        self, model_spec: str, sandbox=None, owns_sandbox: bool | None = None
+    ) -> Solver:
         """Create a Pydantic AI solver. Pass sandbox to reuse an existing container (quota fallback)."""
         solver = Solver(
             model_spec=model_spec,
@@ -156,7 +169,7 @@ class ChallengeSwarm:
         """Cooldown-gated, deduplicated flag submission. Returns (display, is_confirmed)."""
         async with self._flag_lock:
             if self.confirmed_flag:
-                return f"ALREADY SOLVED — flag already confirmed: {self.confirmed_flag}", True
+                return "ALREADY SOLVED — challenge already confirmed", True
 
             normalized = flag.strip()
 
@@ -182,16 +195,34 @@ class ChallengeSwarm:
 
             self._submitted_flags.add(normalized)
 
-            from backend.tools.core import do_submit_flag
-            display, is_confirmed = await do_submit_flag(self.ctfd, self.meta.name, flag)
+            try:
+                submission = await self.ctfd.submit_flag(self.meta.name, normalized)
+                display = submission.display
+                is_confirmed = submission.status in ("correct", "already_solved")
+            except Exception as exc:
+                display, is_confirmed = f"submit_flag error: {exc}", False
+
             if is_confirmed:
-                self.confirmed_flag = normalized
+                # An already-solved response confirms the challenge, not this candidate flag.
+                correct_flag = normalized if submission.status == "correct" else None
+                self.confirmed_flag = correct_flag or "<already solved>"
+                self._confirmed_result = SolverResult(
+                    flag=correct_flag,
+                    status=FLAG_FOUND,
+                    findings_summary=display,
+                    step_count=0,
+                    cost_usd=0.0,
+                    log_path="",
+                )
+                self._confirmed_event.set()
             else:
                 self._submit_count[model_spec] = wrong_count + 1
                 self._last_submit_time[model_spec] = time.monotonic()
             return display, is_confirmed
 
     async def _run_solver(self, model_spec: str) -> SolverResult | None:
+        if self.cancel_event.is_set():
+            return None
         solver = self._create_solver(model_spec)
         self.solvers[model_spec] = solver
 
@@ -203,35 +234,66 @@ class ChallengeSwarm:
             logger.error(f"[{self.meta.name}/{model_spec}] Fatal: {e}", exc_info=True)
             return None
         finally:
-            await solver.stop()
+            await self._stop_solver_task(model_spec)
 
-    async def _run_solver_loop(self, solver, model_spec: str) -> tuple[SolverResult, SolverProtocol]:
+    async def _stop_solver_task(self, model_spec: str) -> None:
+        """Finish solver shutdown even if this task is cancelled during cleanup."""
+        task = asyncio.current_task()
+        if task:
+            self._stopping_tasks.add(task)
+        try:
+            await self._finish_cleanup(self.solvers[model_spec].stop())
+        finally:
+            if task:
+                self._stopping_tasks.discard(task)
+
+    @staticmethod
+    async def _finish_cleanup(awaitable: Coroutine[Any, Any, None]) -> None:
+        """Shield one cleanup operation and re-raise cancellation after it finishes."""
+        cleanup = asyncio.create_task(awaitable)
+        interrupted = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                interrupted = True
+        await cleanup
+        if interrupted:
+            raise asyncio.CancelledError from None
+
+    async def _run_solver_loop(
+        self, solver: SolverProtocol, model_spec: str
+    ) -> tuple[SolverResult, SolverProtocol]:
         """Inner loop: start → run → bump → run → ..."""
         bump_count = 0
         consecutive_errors = 0
         result = SolverResult(
-            flag=None, status=CANCELLED, findings_summary="",
-            step_count=0, cost_usd=0.0, log_path="",
+            flag=None,
+            status=CANCELLED,
+            findings_summary="",
+            step_count=0,
+            cost_usd=0.0,
+            log_path="",
         )
+        if self.cancel_event.is_set():
+            return result, solver
         await solver.start()
 
         while not self.cancel_event.is_set():
             result = await solver.run_until_done_or_gave_up()
 
             # Only broadcast useful findings — skip errors and broken solvers
-            if (result.status not in (ERROR, QUOTA_ERROR)
-                    and not (result.step_count == 0 and result.cost_usd == 0)
-                    and result.findings_summary
-                    and not result.findings_summary.startswith(("Error:", "Turn failed:"))):
+            if (
+                result.status not in (ERROR, QUOTA_ERROR)
+                and not (result.step_count == 0 and result.cost_usd == 0)
+                and result.findings_summary
+                and not result.findings_summary.startswith(("Error:", "Turn failed:"))
+            ):
                 self.findings[model_spec] = result.findings_summary
                 await self.message_bus.post(model_spec, result.findings_summary[:500])
 
             if result.status == FLAG_FOUND:
-                self.cancel_event.set()
-                self.winner = result
-                logger.info(
-                    f"[{self.meta.name}] Flag found by {model_spec}: {result.flag}"
-                )
+                logger.info(f"[{self.meta.name}] Flag found by {model_spec}: {result.flag}")
                 return result, solver
 
             if result.status == CANCELLED:
@@ -245,11 +307,26 @@ class ChallengeSwarm:
                         f"[{self.meta.name}/{model_spec}] Quota exhausted — falling back to {fallback_spec}"
                     )
                     existing_sandbox = solver.sandbox
-                    # Detach sandbox from old solver so stop() doesn't destroy it
-                    solver.sandbox = None  # type: ignore[assignment]
-                    await solver.stop()
-                    solver = self._create_pydantic_solver(fallback_spec, sandbox=existing_sandbox, owns_sandbox=True)
-                    self.solvers[model_spec] = solver
+                    if existing_sandbox is None:
+                        raise RuntimeError("Quota fallback has no sandbox to transfer")
+                    # Transfer ownership before stopping the old solver. Store the
+                    # fallback in shared state first so cancellation cleanup targets it.
+                    fallback = cast(
+                        SolverProtocol,
+                        self._create_pydantic_solver(
+                            fallback_spec, sandbox=existing_sandbox, owns_sandbox=True
+                        ),
+                    )
+                    self.solvers[model_spec] = fallback
+                    try:
+                        solver.sandbox = None  # type: ignore[assignment]
+                        await self._finish_cleanup(solver.stop())
+                    except BaseException:
+                        await self._finish_cleanup(fallback.stop())
+                        raise
+                    solver = fallback
+                    if self.cancel_event.is_set():
+                        break
                     await solver.start()
                     continue
                 # No fallback available, treat as error
@@ -285,51 +362,78 @@ class ChallengeSwarm:
                     pass  # cooldown elapsed, proceed with bump
                 insights = self._gather_sibling_insights(model_spec)
                 solver.bump(insights)
-                logger.info(
-                    f"[{self.meta.name}/{model_spec}] Bumped ({bump_count}), resuming"
-                )
+                logger.info(f"[{self.meta.name}/{model_spec}] Bumped ({bump_count}), resuming")
                 continue
 
         return result, solver
 
     async def run(self) -> SolverResult | None:
-        """Run all solvers in parallel. Returns the winner's result or None."""
-        tasks = [
+        """Run solvers until CTFd confirms a solve or one returns a dry-run flag."""
+        if self.cancel_event.is_set():
+            return None
+        self._solver_tasks = {
             asyncio.create_task(self._run_solver(spec), name=f"solver-{spec}")
             for spec in self.model_specs
-        ]
-
+        }
+        confirmed_waiter = asyncio.create_task(self._confirmed_event.wait())
+        pending = set(self._solver_tasks)
         try:
-            while tasks:
-                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-
-                for task in done:
+            while pending and not self.cancel_event.is_set():
+                done, pending_with_signal = await asyncio.wait(
+                    pending | {confirmed_waiter}, return_when=asyncio.FIRST_COMPLETED
+                )
+                pending = pending_with_signal - {confirmed_waiter}
+                if self._confirmed_event.is_set():
+                    self.winner = self._confirmed_result
+                    break
+                for task in done - {confirmed_waiter}:
                     try:
                         result = task.result()
-                    except Exception:
+                    except asyncio.CancelledError:
                         continue
-                    if result and result.status == FLAG_FOUND:
-                        self.cancel_event.set()
-                        for p in pending:
-                            p.cancel()
-                        await asyncio.gather(*pending, return_exceptions=True)
-                        return result
-
-                tasks = list(pending)
-
-            self.cancel_event.set()
+                    except Exception:
+                        logger.exception("[%s] Solver task failed", self.meta.name)
+                        continue
+                    solver_result = cast(SolverResult | None, result)
+                    if solver_result and solver_result.status == FLAG_FOUND:
+                        self.winner = solver_result
+                        break
+                if self.winner:
+                    break
             return self.winner
-        except Exception as e:
-            logger.error(f"[{self.meta.name}] Swarm error: {e}", exc_info=True)
-            self.cancel_event.set()
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            return None
+        finally:
+            self.kill()
+            confirmed_waiter.cancel()
+            drain = asyncio.create_task(self._drain_solver_tasks(confirmed_waiter))
+            interrupted = False
+            while not drain.done():
+                try:
+                    await asyncio.shield(drain)
+                except asyncio.CancelledError:
+                    interrupted = True
+                    self.kill()
+            await drain
+            if interrupted:
+                raise asyncio.CancelledError from None
+
+    async def _drain_solver_tasks(self, confirmed_waiter: asyncio.Task) -> None:
+        await asyncio.gather(confirmed_waiter, return_exceptions=True)
+        results = await asyncio.gather(*self._solver_tasks, return_exceptions=True)
+        failures = [
+            result
+            for result in results
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError)
+        ]
+        if failures:
+            raise RuntimeError(f"{self.meta.name}: solver cleanup failed") from failures[0]
+        self._solver_tasks.clear()
 
     def kill(self) -> None:
-        """Cancel all agents for this challenge."""
+        """Stop running solver work; run() waits for cleanup before returning."""
         self.cancel_event.set()
+        for task in self._solver_tasks - self._stopping_tasks:
+            if not task.done():
+                task.cancel()
 
     def get_status(self) -> dict:
         """Get per-agent progress and findings."""
@@ -340,8 +444,9 @@ class ChallengeSwarm:
             "agents": {
                 spec: {
                     "findings": self.findings.get(spec, ""),
-                    "status": "running" if spec in self.solvers and not self.cancel_event.is_set()
-                             else ("won" if self.winner and self.winner.flag else "finished"),
+                    "status": "running"
+                    if spec in self.solvers and not self.cancel_event.is_set()
+                    else ("won" if self.winner and self.winner.flag else "finished"),
                 }
                 for spec in self.model_specs
             },

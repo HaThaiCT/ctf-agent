@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import boto3
+from google.genai.types import ThinkingLevel
 from pydantic_ai.models import Model
 from pydantic_ai.models.bedrock import BedrockConverseModel, BedrockModelSettings
 from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
-from pydantic_ai.models.openai import OpenAIModel, OpenAIModelSettings
+from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.bedrock import BedrockProvider
 from pydantic_ai.providers.google import GoogleProvider
 from pydantic_ai.providers.openai import OpenAIProvider
@@ -69,7 +70,7 @@ def resolve_model(spec: str, settings: Settings) -> Model:
                     provider=BedrockProvider(bedrock_client=client),
                 )
         case "azure":
-            return OpenAIModel(
+            return OpenAIChatModel(
                 model_id,
                 provider=OpenAIProvider(
                     base_url=settings.azure_openai_endpoint,
@@ -77,7 +78,7 @@ def resolve_model(spec: str, settings: Settings) -> Model:
                 ),
             )
         case "zen":
-            return OpenAIModel(
+            return OpenAIChatModel(
                 model_id,
                 provider=OpenAIProvider(
                     base_url="https://opencode.ai/zen/v1",
@@ -113,14 +114,14 @@ def resolve_model_settings(spec: str) -> ModelSettings:
             # Azure/Zen use OpenAI chat completions — server-side prompt caching
             # is automatic, no explicit config needed. Set max_tokens to avoid
             # reserving the full context window.
-            return OpenAIModelSettings(
+            return OpenAIChatModelSettings(
                 max_tokens=128_000,
             )
         case "google":
             return GoogleModelSettings(
                 max_tokens=64_000,
                 google_thinking_config={
-                    "thinking_level": "high",
+                    "thinking_level": ThinkingLevel.HIGH,
                     "include_thoughts": True,
                 },
             )
@@ -129,9 +130,13 @@ def resolve_model_settings(spec: str) -> ModelSettings:
 
 
 def model_id_from_spec(spec: str) -> str:
-    """Extract just the model ID from a spec (strips effort suffix)."""
+    """Extract the model ID, preserving router IDs that contain slashes."""
     parts = spec.split("/")
-    return parts[1] if len(parts) >= 2 else spec
+    if len(parts) < 2:
+        return spec
+    if len(parts) >= 3 and parts[-1] in ("low", "medium", "high", "max"):
+        return "/".join(parts[1:-1])
+    return "/".join(parts[1:])
 
 
 def provider_from_spec(spec: str) -> str:
@@ -139,11 +144,15 @@ def provider_from_spec(spec: str) -> str:
     return spec.split("/", 1)[0]
 
 
-def effort_from_spec(spec: str) -> str | None:
+def effort_from_spec(spec: str) -> Literal["low", "medium", "high", "max"] | None:
     """Extract effort level from a spec like 'claude-sdk/claude-opus-4-6/max'."""
     parts = spec.split("/")
-    if len(parts) >= 3 and parts[2] in ("low", "medium", "high", "max"):
-        return parts[2]
+    if (
+        parts[0] == "claude-sdk"
+        and len(parts) >= 3
+        and parts[-1] in ("low", "medium", "high", "max")
+    ):
+        return parts[-1]
     return None
 
 

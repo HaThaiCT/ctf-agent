@@ -17,6 +17,7 @@ import aiodocker
 logger = logging.getLogger(__name__)
 
 CONTAINER_LABEL = "ctf-agent"
+CLEANUP_TIMEOUT_S = 30
 
 # Concurrency control
 _start_semaphore: asyncio.Semaphore | None = None
@@ -86,6 +87,7 @@ class DockerSandbox:
     _container: Any = field(default=None, repr=False)
     _docker: Any = field(default=None, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _started: bool = field(default=False, repr=False)
 
     @property
     def container_id(self) -> str:
@@ -102,7 +104,7 @@ class DockerSandbox:
             if s.endswith("m"):
                 return int(s[:-1]) * 1024 * 1024
             return int(s)
-        except (ValueError, IndexError):
+        except ValueError, IndexError:
             logger.warning("Invalid memory_limit %r, defaulting to 4GB", self.memory_limit)
             return 4 * 1024 * 1024 * 1024
 
@@ -134,19 +136,41 @@ class DockerSandbox:
                     "ExtraHosts": ["host.docker.internal:host-gateway"],
                     "CapAdd": ["SYS_ADMIN", "SYS_PTRACE"],
                     "SecurityOpt": ["seccomp=unconfined"],
-                    "Devices": [{"PathOnHost": "/dev/loop-control", "PathInContainer": "/dev/loop-control", "CgroupPermissions": "rwm"}],
+                    "Devices": [
+                        {
+                            "PathOnHost": "/dev/loop-control",
+                            "PathInContainer": "/dev/loop-control",
+                            "CgroupPermissions": "rwm",
+                        }
+                    ],
                     "Memory": self._parse_memory_limit(),
                     "NanoCpus": int(2 * 1e9),
                 },
             }
 
-            self._container = await self._docker.containers.create(config)
-            await self._container.start()
-            await _track_start()
+            try:
+                self._container = await self._docker.containers.create(config)
+                await self._container.start()
+                await _track_start()
+                self._started = True
 
-            info = await self._container.show()
-            short_id = info["Id"][:12]
-            logger.info("Sandbox started: %s", short_id)
+                info = await self._container.show()
+                short_id = info["Id"][:12]
+                logger.info("Sandbox started: %s", short_id)
+            except BaseException:
+                # Do not let task cancellation interrupt removal of a partially
+                # created container. Keep handles intact if removal itself fails.
+                cleanup = asyncio.create_task(self.stop())
+                interrupted = False
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        interrupted = True
+                await cleanup
+                if interrupted:
+                    raise asyncio.CancelledError from None
+                raise
 
     async def exec(self, command: str, timeout_s: int = 300) -> ExecResult:
         if not self._container:
@@ -272,24 +296,32 @@ class DockerSandbox:
     async def stop(self) -> None:
         if self._container:
             try:
-                await self._container.delete(force=True)
+                await asyncio.wait_for(
+                    self._container.delete(force=True), timeout=CLEANUP_TIMEOUT_S
+                )
+            except aiodocker.exceptions.DockerError as exc:
+                if exc.status != 404:
+                    logger.error("Could not remove sandbox %s: %s", self._container.id, exc)
+                    raise
             except Exception:
-                pass
+                logger.exception("Could not remove sandbox %s", self._container.id)
+                raise
             self._container = None
-            await _track_stop()
+            if self._started:
+                await _track_stop()
+                self._started = False
 
         if self._docker:
             try:
-                await self._docker.close()
+                await asyncio.wait_for(self._docker.close(), timeout=CLEANUP_TIMEOUT_S)
             except Exception:
-                pass
-            self._docker = None
+                logger.exception("Could not close sandbox Docker client")
+            finally:
+                self._docker = None
 
         if self.workspace_dir:
             import shutil
-            try:
-                shutil.rmtree(self.workspace_dir, ignore_errors=True)
-            except Exception:
-                pass
+
+            shutil.rmtree(self.workspace_dir)
             self.workspace_dir = ""
         logger.info("Sandbox stopped")

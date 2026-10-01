@@ -149,10 +149,14 @@ class CTFdClient:
         message = resp.get("data", {}).get("message", "")
 
         if status == "correct":
-            return SubmitResult("correct", message, f'CORRECT — "{flag}" accepted. {message}'.strip())
+            return SubmitResult(
+                "correct", message, f'CORRECT — "{flag}" accepted. {message}'.strip()
+            )
         if status == "already_solved":
             return SubmitResult(
-                "already_solved", message, f'ALREADY SOLVED — "{flag}" accepted. {message}'.strip()
+                "already_solved",
+                message,
+                f"ALREADY SOLVED — challenge was already solved; candidate was not verified. {message}".strip(),
             )
         if status == "incorrect":
             return SubmitResult(
@@ -217,17 +221,27 @@ class CTFdClient:
         for raw_url in challenge.get("files") or []:
             dist_dir = ch_dir / "distfiles"
             dist_dir.mkdir(exist_ok=True)
-            url = raw_url if raw_url.startswith("http") else f"{self.base_url.rstrip('/')}/{raw_url.lstrip('/')}"
+            url = (
+                raw_url
+                if raw_url.startswith("http")
+                else f"{self.base_url.rstrip('/')}/{raw_url.lstrip('/')}"
+            )
             url_path = urlparse(url).path
             fname = url_path.rstrip("/").rsplit("/", 1)[-1] or "file"
             dest = dist_dir / fname
             if not dest.exists():
                 try:
                     # Only send auth headers to our CTFd server
-                    headers = self._base_headers() if urlparse(url).hostname == urlparse(self.base_url).hostname else {}
+                    headers = (
+                        self._base_headers()
+                        if urlparse(url).hostname == urlparse(self.base_url).hostname
+                        else {}
+                    )
                     resp = await client.get(
-                        url, headers=headers,
-                        follow_redirects=True, timeout=60.0,
+                        url,
+                        headers=headers,
+                        follow_redirects=True,
+                        timeout=60.0,
                     )
                     resp.raise_for_status()
                     dest.write_bytes(resp.content)
@@ -244,7 +258,9 @@ class CTFdClient:
         except Exception:
             pass
 
-        tags = [t["value"] if isinstance(t, dict) else str(t) for t in (challenge.get("tags") or [])]
+        tags = [
+            t["value"] if isinstance(t, dict) else str(t) for t in (challenge.get("tags") or [])
+        ]
         meta = {
             "name": name,
             "category": challenge.get("category", ""),

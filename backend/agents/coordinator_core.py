@@ -37,16 +37,22 @@ async def do_get_solve_status(deps: CoordinatorDeps) -> str:
     return json.dumps({"solved": sorted(solved), "active_swarms": swarm_status}, indent=2)
 
 
+def mark_challenge_solved(deps: CoordinatorDeps, challenge_name: str) -> None:
+    """Stop a confirmed challenge without waiting for a coordinator LLM turn."""
+    deps.solved_challenges.add(challenge_name)
+    swarm = deps.swarms.get(challenge_name)
+    if swarm:
+        swarm.kill()
+
+
 async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
-    # Retire ALL finished swarms before checking capacity
-    finished = [
-        name for name, swarm in deps.swarms.items()
-        if swarm.cancel_event.is_set()
-        or (name in deps.swarm_tasks and deps.swarm_tasks[name].done())
-    ]
-    for name in finished:
-        del deps.swarms[name]
-        deps.swarm_tasks.pop(name, None)
+    async with deps.spawn_lock:
+        return await _spawn_swarm_locked(deps, challenge_name)
+
+
+async def _spawn_swarm_locked(deps: CoordinatorDeps, challenge_name: str) -> str:
+    if challenge_name in deps.solved_challenges:
+        return f"Challenge '{challenge_name}' is already solved"
 
     active_count = len(deps.swarms)
     if active_count >= deps.max_concurrent_challenges:
@@ -64,7 +70,12 @@ async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
         output_dir = str(Path(deps.challenges_root))
         ch_dir = await deps.ctfd.pull_challenge(ch_data, output_dir)
         deps.challenge_dirs[challenge_name] = ch_dir
-        deps.challenge_metas[challenge_name] = ChallengeMeta.from_yaml(Path(ch_dir) / "metadata.yml")
+        deps.challenge_metas[challenge_name] = ChallengeMeta.from_yaml(
+            Path(ch_dir) / "metadata.yml"
+        )
+
+    if challenge_name in deps.solved_challenges:
+        return f"Challenge '{challenge_name}' is already solved"
 
     from backend.agents.swarm import ChallengeSwarm
 
@@ -79,11 +90,13 @@ async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
         coordinator_inbox=deps.coordinator_inbox,
     )
     deps.swarms[challenge_name] = swarm
+    deps.auto_attempted.add(challenge_name)
 
     async def _run_and_cleanup() -> None:
         result = await swarm.run()
-        # Flag already submitted/confirmed by solver's submit_fn — just record the result
         if result and result.status == FLAG_FOUND:
+            if not deps.no_submit:
+                mark_challenge_solved(deps, challenge_name)
             deps.results[challenge_name] = {
                 "flag": result.flag,
                 "submit": "DRY RUN" if deps.no_submit else "confirmed by solver",
@@ -91,6 +104,7 @@ async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
 
     task = asyncio.create_task(_run_and_cleanup(), name=f"swarm-{challenge_name}")
     deps.swarm_tasks[challenge_name] = task
+    task.add_done_callback(lambda _: deps.capacity_changed.set())
     return f"Swarm spawned for {challenge_name} with {len(deps.model_specs)} models"
 
 
@@ -106,6 +120,12 @@ async def do_submit_flag(deps: CoordinatorDeps, challenge_name: str, flag: str) 
         return f'DRY RUN — would submit "{flag.strip()}" for {challenge_name}'
     try:
         result = await deps.ctfd.submit_flag(challenge_name, flag)
+        if result.status in ("correct", "already_solved"):
+            mark_challenge_solved(deps, challenge_name)
+            deps.results[challenge_name] = {
+                "flag": flag.strip() if result.status == "correct" else None,
+                "submit": "confirmed by coordinator",
+            }
         return result.display
     except Exception as e:
         return f"submit_flag error: {e}"
@@ -119,7 +139,9 @@ async def do_kill_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
     return f"Swarm for {challenge_name} cancelled"
 
 
-async def do_bump_agent(deps: CoordinatorDeps, challenge_name: str, model_spec: str, insights: str) -> str:
+async def do_bump_agent(
+    deps: CoordinatorDeps, challenge_name: str, model_spec: str, insights: str
+) -> str:
     swarm = deps.swarms.get(challenge_name)
     if not swarm:
         return f"No swarm running for {challenge_name}"
@@ -130,7 +152,9 @@ async def do_bump_agent(deps: CoordinatorDeps, challenge_name: str, model_spec: 
     return f"Bumped {model_spec} on {challenge_name}"
 
 
-async def do_read_solver_trace(deps: CoordinatorDeps, challenge_name: str, model_spec: str, last_n: int = 20) -> str:
+async def do_read_solver_trace(
+    deps: CoordinatorDeps, challenge_name: str, model_spec: str, last_n: int = 20
+) -> str:
     """Read the last N trace events from a solver's JSONL log."""
     swarm = deps.swarms.get(challenge_name)
     if not swarm:
@@ -152,14 +176,22 @@ async def do_read_solver_trace(deps: CoordinatorDeps, challenge_name: str, model
                 t = d.get("type", "?")
                 if t == "tool_call":
                     args_str = str(d.get("args", ""))[:100]
-                    summary.append(f"step {d.get('step','?')} CALL {d.get('tool','?')}: {args_str}")
+                    summary.append(
+                        f"step {d.get('step', '?')} CALL {d.get('tool', '?')}: {args_str}"
+                    )
                 elif t == "tool_result":
                     result_str = str(d.get("result", ""))[:100]
-                    summary.append(f"step {d.get('step','?')} RESULT {d.get('tool','?')}: {result_str}")
+                    summary.append(
+                        f"step {d.get('step', '?')} RESULT {d.get('tool', '?')}: {result_str}"
+                    )
                 elif t in ("finish", "error", "bump", "turn_failed"):
-                    summary.append(f"** {t}: {json.dumps({k:v for k,v in d.items() if k != 'ts'})}")
+                    summary.append(
+                        f"** {t}: {json.dumps({k: v for k, v in d.items() if k != 'ts'})}"
+                    )
                 elif t == "usage":
-                    summary.append(f"usage: in={d.get('input_tokens',0)} out={d.get('output_tokens',0)} cost=${d.get('cost_usd',0):.4f}")
+                    summary.append(
+                        f"usage: in={d.get('input_tokens', 0)} out={d.get('output_tokens', 0)} cost=${d.get('cost_usd', 0):.4f}"
+                    )
                 else:
                     summary.append(f"{t}: {str(d)[:80]}")
             except Exception:

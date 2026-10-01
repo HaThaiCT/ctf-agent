@@ -71,27 +71,50 @@ SANDBOX_TOOLS = [
     {
         "name": "read_file",
         "description": "Read a file from the sandbox container.",
-        "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+        "inputSchema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
     },
     {
         "name": "write_file",
         "description": "Write a file into the sandbox container.",
-        "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]},
+        "inputSchema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path", "content"],
+        },
     },
     {
         "name": "list_files",
         "description": "List files in a directory in the sandbox.",
-        "inputSchema": {"type": "object", "properties": {"path": {"type": "string", "default": "/challenge/distfiles"}}},
+        "inputSchema": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "default": "/challenge/distfiles"}},
+        },
     },
     {
         "name": "submit_flag",
         "description": "Submit a flag to CTFd. Returns CORRECT, ALREADY SOLVED, or INCORRECT.",
-        "inputSchema": {"type": "object", "properties": {"flag": {"type": "string"}}, "required": ["flag"]},
+        "inputSchema": {
+            "type": "object",
+            "properties": {"flag": {"type": "string"}},
+            "required": ["flag"],
+        },
     },
     {
         "name": "web_fetch",
         "description": "Fetch a URL from the host network.",
-        "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}, "method": {"type": "string", "default": "GET"}, "body": {"type": "string", "default": ""}}, "required": ["url"]},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "method": {"type": "string", "default": "GET"},
+                "body": {"type": "string", "default": ""},
+            },
+            "required": ["url"],
+        },
     },
     {
         "name": "webhook_create",
@@ -101,17 +124,29 @@ SANDBOX_TOOLS = [
     {
         "name": "webhook_get_requests",
         "description": "Retrieve HTTP requests received by a webhook.site token.",
-        "inputSchema": {"type": "object", "properties": {"uuid": {"type": "string"}}, "required": ["uuid"]},
+        "inputSchema": {
+            "type": "object",
+            "properties": {"uuid": {"type": "string"}},
+            "required": ["uuid"],
+        },
     },
     {
         "name": "view_image",
         "description": "View an image file from the sandbox for visual/steg analysis.",
-        "inputSchema": {"type": "object", "properties": {"filename": {"type": "string"}}, "required": ["filename"]},
+        "inputSchema": {
+            "type": "object",
+            "properties": {"filename": {"type": "string"}},
+            "required": ["filename"],
+        },
     },
     {
         "name": "notify_coordinator",
         "description": "Send a strategic message to the coordinator (e.g. flag format discovery, shared vulnerability, request for help).",
-        "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}}, "required": ["message"]},
+        "inputSchema": {
+            "type": "object",
+            "properties": {"message": {"type": "string"}},
+            "required": ["message"],
+        },
     },
 ]
 
@@ -179,12 +214,15 @@ class CodexSolver:
 
         distfile_names = list_distfiles(self.challenge_dir)
         system_prompt = build_prompt(
-            self.meta, distfile_names, container_arch=container_arch,
+            self.meta,
+            distfile_names,
+            container_arch=container_arch,
             has_named_tools=True,
         )
 
         self._proc = await asyncio.create_subprocess_exec(
-            "codex", "app-server",
+            "codex",
+            "app-server",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -193,10 +231,13 @@ class CodexSolver:
         self._reader_task = asyncio.create_task(self._read_loop())
 
         # Initialize handshake: send initialize request, then initialized notification
-        await self._rpc("initialize", {
-            "clientInfo": {"name": "ctf-agent", "version": "2.0.0"},
-            "capabilities": {"experimentalApi": True},
-        })
+        await self._rpc(
+            "initialize",
+            {
+                "clientInfo": {"name": "ctf-agent", "version": "2.0.0"},
+                "capabilities": {"experimentalApi": True},
+            },
+        )
         await self._send_notification("initialized", {})
 
         # thread/start — personality is enum, system prompt in baseInstructions
@@ -307,7 +348,7 @@ class CodexSolver:
                                 parsed = json.loads(text)
                                 if isinstance(parsed, dict) and "type" in parsed:
                                     self._structured_output = parsed
-                            except (json.JSONDecodeError, ValueError):
+                            except json.JSONDecodeError, ValueError:
                                 pass
 
             # Notification: turn completed — signals the turn is done
@@ -347,18 +388,27 @@ class CodexSolver:
                 # Proactive compaction at 70% context window (only for small-context models like spark)
                 context_window = token_usage.get("modelContextWindow")
                 total_tokens = total.get("totalTokens", 0)
-                if context_window and context_window < 200_000 and total_tokens > context_window * 0.7:
-                    if not self._compact_requested:
-                        self._compact_requested = True
-                        logger.info(f"[{self.agent_name}] Requesting compaction ({total_tokens}/{context_window} tokens)")
-                        try:
-                            await self._rpc("thread/compact/start", {"threadId": self._thread_id})
-                            self.tracer.event("compact_requested", tokens=total_tokens, window=context_window)
-                        except Exception as e:
-                            logger.warning(f"[{self.agent_name}] Compaction request failed: {e}")
+                if (
+                    context_window
+                    and context_window < 200_000
+                    and total_tokens > context_window * 0.7
+                    and not self._compact_requested
+                ):
+                    self._compact_requested = True
+                    logger.info(
+                        f"[{self.agent_name}] Requesting compaction ({total_tokens}/{context_window} tokens)"
+                    )
+                    try:
+                        await self._rpc("thread/compact/start", {"threadId": self._thread_id})
+                        self.tracer.event(
+                            "compact_requested", tokens=total_tokens, window=context_window
+                        )
+                    except Exception as e:
+                        logger.warning(f"[{self.agent_name}] Compaction request failed: {e}")
 
                 self.cost_tracker.record_tokens(
-                    self.agent_name, self.model_id,
+                    self.agent_name,
+                    self.model_id,
                     input_tokens=last.get("inputTokens", 0),
                     output_tokens=last.get("outputTokens", 0),
                     cache_read_tokens=last.get("cachedInputTokens", 0),
@@ -394,6 +444,7 @@ class CodexSolver:
             result = await self._exec_tool(tool_name, args)
             if loop_status == "warn" and isinstance(result, str):
                 from backend.loop_detect import LOOP_WARNING_MESSAGE
+
                 result = f"{result}\n\n{LOOP_WARNING_MESSAGE}"
 
         # Build content items — handle image tuples from view_image
@@ -401,27 +452,35 @@ class CodexSolver:
             image_bytes, mime_type = result
             data_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode()}"
             content_items = [{"type": "inputImage", "imageUrl": data_url}]
-            self.tracer.tool_result(tool_name, f"image:{mime_type}:{len(image_bytes)}b", self._step_count)
+            self.tracer.tool_result(
+                tool_name, f"image:{mime_type}:{len(image_bytes)}b", self._step_count
+            )
         else:
             result_text = str(result)
             self.tracer.tool_result(tool_name, result_text[:500], self._step_count)
 
             if self._step_count % 5 == 0 and self.message_bus:
                 from backend.tools.core import do_check_findings
+
                 findings = await do_check_findings(self.message_bus, self.model_spec)
                 if findings and "No new findings" not in findings:
                     result_text = f"{result_text}\n\n---\n{findings}"
 
             content_items = [{"type": "inputText", "text": result_text}]
 
-        await self._respond_to_request(request_id, {
-            "contentItems": content_items,
-            "success": True,
-        })
+        await self._respond_to_request(
+            request_id,
+            {
+                "contentItems": content_items,
+                "success": True,
+            },
+        )
 
     async def _exec_tool(self, name: str, args: dict) -> str | tuple[bytes, str]:
         if name == "bash":
-            return await do_bash(self.sandbox, args.get("command", ""), args.get("timeout_seconds", 60))
+            return await do_bash(
+                self.sandbox, args.get("command", ""), args.get("timeout_seconds", 60)
+            )
         elif name == "read_file":
             return str(await do_read_file(self.sandbox, args.get("path", "")))
         elif name == "write_file":
@@ -436,19 +495,24 @@ class CodexSolver:
                 display, is_confirmed = await self.submit_fn(flag)
             else:
                 from backend.tools.core import do_submit_flag
+
                 display, is_confirmed = await do_submit_flag(self.ctfd, self.meta.name, flag)
             if is_confirmed:
                 self._confirmed = True
                 self._flag = flag
             return display
         elif name == "web_fetch":
-            return await do_web_fetch(args.get("url", ""), args.get("method", "GET"), args.get("body", ""))
+            return await do_web_fetch(
+                args.get("url", ""), args.get("method", "GET"), args.get("body", "")
+            )
         elif name == "webhook_create":
             return await do_webhook_create()
         elif name == "webhook_get_requests":
             return await do_webhook_get_requests(args.get("uuid", ""))
         elif name == "view_image":
-            return await do_view_image(self.sandbox, args.get("filename", ""), use_vision=self.use_vision)
+            return await do_view_image(
+                self.sandbox, args.get("filename", ""), use_vision=self.use_vision
+            )
         elif name == "notify_coordinator":
             if self.notify_coordinator:
                 await self.notify_coordinator(args.get("message", ""))
@@ -478,11 +542,14 @@ class CodexSolver:
             self._turn_done.clear()
             self._structured_output = None
             self._turn_error = None
-            await self._rpc("turn/start", {
-                "threadId": self._thread_id,
-                "input": [{"type": "text", "text": prompt_text}],
-                "outputSchema": solver_output_json_schema(),
-            })
+            await self._rpc(
+                "turn/start",
+                {
+                    "threadId": self._thread_id,
+                    "input": [{"type": "text", "text": prompt_text}],
+                    "outputSchema": solver_output_json_schema(),
+                },
+            )
 
             await self._turn_done.wait()
 
@@ -498,12 +565,13 @@ class CodexSolver:
                     return self._result(QUOTA_ERROR)
                 return self._result(ERROR)
 
-            if self._structured_output:
-                if self._structured_output.get("type") == "flag_found":
-                    self._flag = self._structured_output.get("flag")
-                    self._findings = f"Flag found via {self._structured_output.get('method', '?')}: {self._flag}"
-                    if self.no_submit:
-                        self._confirmed = True
+            if self._structured_output and self._structured_output.get("type") == "flag_found":
+                self._flag = self._structured_output.get("flag")
+                self._findings = (
+                    f"Flag found via {self._structured_output.get('method', '?')}: {self._flag}"
+                )
+                if self.no_submit:
+                    self._confirmed = True
 
             if self._confirmed and self._flag:
                 return self._result(FLAG_FOUND)
@@ -528,10 +596,12 @@ class CodexSolver:
     def _result(self, status: str) -> SolverResult:
         self.tracer.event("finish", status=status, flag=self._flag, confirmed=self._confirmed)
         return SolverResult(
-            flag=self._flag, status=status,
+            flag=self._flag,
+            status=status,
             findings_summary=self._findings[:2000],
             step_count=self._step_count,
-            cost_usd=self._cost_usd, log_path=self.tracer.path,
+            cost_usd=self._cost_usd,
+            log_path=self.tracer.path,
         )
 
     async def stop(self) -> None:
@@ -541,17 +611,18 @@ class CodexSolver:
             self._reader_task.cancel()
             try:
                 await self._reader_task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError, Exception:
                 pass
-        if self._proc:
-            try:
-                self._proc.terminate()
-                await asyncio.wait_for(self._proc.wait(), timeout=5)
-            except Exception:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
-            self._proc = None
-        if self.sandbox:
-            await self.sandbox.stop()
+        try:
+            if self._proc:
+                if self._proc.returncode is None:
+                    self._proc.terminate()
+                    try:
+                        await asyncio.wait_for(self._proc.wait(), timeout=5)
+                    except TimeoutError:
+                        self._proc.kill()
+                        await self._proc.wait()
+                self._proc = None
+        finally:
+            if self.sandbox:
+                await self.sandbox.stop()

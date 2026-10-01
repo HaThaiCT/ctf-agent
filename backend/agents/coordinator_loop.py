@@ -7,7 +7,7 @@ import json
 import logging
 from collections.abc import Callable, Coroutine
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from backend.config import Settings
 from backend.cost_tracker import CostTracker
@@ -21,6 +21,14 @@ logger = logging.getLogger(__name__)
 
 # Callable type for a coordinator turn: (message) -> None
 TurnFn = Callable[[str], Coroutine[Any, Any, None]]
+
+
+class ChallengeState(Protocol):
+    @property
+    def known_challenges(self) -> set[str]: ...
+
+    @property
+    def known_solved(self) -> set[str]: ...
 
 
 def build_deps(
@@ -82,8 +90,18 @@ async def run_event_loop(
         turn_fn: Async function that sends a message to the coordinator LLM.
         status_interval: Seconds between status updates.
     """
-    poller = CTFdPoller(ctfd=ctfd, interval_s=5.0)
+    from backend.agents.coordinator_core import mark_challenge_solved
+
+    poller = CTFdPoller(
+        ctfd=ctfd,
+        interval_s=5.0,
+        on_solved=lambda name: mark_challenge_solved(deps, name),
+    )
     await poller.start()
+    deps.solved_challenges.update(poller.known_solved)
+    capacity_worker = asyncio.create_task(_watch_capacity(deps, poller))
+    coordinator_turns: asyncio.Queue[str] = asyncio.Queue()
+    turn_worker = asyncio.create_task(_run_coordinator_turns(turn_fn, coordinator_turns))
 
     # Start operator message HTTP endpoint
     msg_server = await _start_msg_server(deps.operator_inbox, deps.msg_port)
@@ -104,10 +122,12 @@ async def run_event_loop(
     )
 
     try:
-        await turn_fn(initial_msg)
+        coordinator_turns.put_nowait(initial_msg)
 
-        # Auto-spawn swarms for unsolved challenges if coordinator LLM didn't
-        await _auto_spawn_unsolved(deps, poller)
+        # Auto-spawn does not wait for the coordinator model; the lock still
+        # serializes any tool-driven spawn requests with this path.
+        deps.auto_attempted.update(deps.swarms)
+        await _auto_spawn_unsolved(deps, poller, deps.auto_attempted)
 
         last_status = asyncio.get_event_loop().time()
 
@@ -118,28 +138,16 @@ async def run_event_loop(
                 events.append(evt)
             events.extend(poller.drain_events())
 
-            # Auto-kill swarms for solved challenges
-            for evt in events:
-                if evt.kind == "challenge_solved" and evt.challenge_name in deps.swarms:
-                    swarm = deps.swarms[evt.challenge_name]
-                    if not swarm.cancel_event.is_set():
-                        swarm.kill()
-                        logger.info("Auto-killed swarm for: %s", evt.challenge_name)
-
             parts: list[str] = []
             for evt in events:
                 if evt.kind == "new_challenge":
                     parts.append(f"NEW CHALLENGE: '{evt.challenge_name}' appeared. Spawn a swarm.")
                     # Auto-spawn for new challenges
-                    await _auto_spawn_one(deps, evt.challenge_name)
+                    await _auto_spawn_one(deps, evt.challenge_name, deps.auto_attempted)
                 elif evt.kind == "challenge_solved":
                     parts.append(f"SOLVED: '{evt.challenge_name}' — swarm auto-killed.")
 
-            # Detect finished swarms
-            for name, task in list(deps.swarm_tasks.items()):
-                if task.done():
-                    parts.append(f"SOLVER FINISHED: Swarm for '{name}' completed. Check results or retry.")
-                    deps.swarm_tasks.pop(name, None)
+            await _auto_spawn_unsolved(deps, poller, deps.auto_attempted)
 
             # Drain solver-to-coordinator messages
             while True:
@@ -178,23 +186,29 @@ async def run_event_loop(
             if parts:
                 msg = "\n\n".join(parts)
                 logger.info("Event -> coordinator: %s", msg[:200])
-                await turn_fn(msg)
+                coordinator_turns.put_nowait(msg)
 
-    except (KeyboardInterrupt, asyncio.CancelledError):
+    except KeyboardInterrupt, asyncio.CancelledError:
         logger.info("Coordinator shutting down...")
     except Exception as e:
         logger.error("Coordinator fatal: %s", e, exc_info=True)
     finally:
+        capacity_worker.cancel()
+        turn_worker.cancel()
+        await asyncio.gather(capacity_worker, turn_worker, return_exceptions=True)
         if msg_server:
             msg_server.close()
             await msg_server.wait_closed()
         await poller.stop()
         for swarm in deps.swarms.values():
             swarm.kill()
-        for task in deps.swarm_tasks.values():
-            task.cancel()
         if deps.swarm_tasks:
-            await asyncio.gather(*deps.swarm_tasks.values(), return_exceptions=True)
+            cleanup_results = await asyncio.gather(
+                *deps.swarm_tasks.values(), return_exceptions=True
+            )
+            for name, result in zip(deps.swarm_tasks, cleanup_results, strict=True):
+                if isinstance(result, BaseException):
+                    logger.error("Swarm %s cleanup failed during shutdown: %s", name, result)
         cost_tracker.log_summary()
         try:
             await ctfd.close()
@@ -208,26 +222,72 @@ async def run_event_loop(
     }
 
 
-async def _auto_spawn_one(deps: CoordinatorDeps, challenge_name: str) -> None:
-    """Auto-spawn a swarm for a single challenge if not already running."""
-    if challenge_name in deps.swarms:
+async def _run_coordinator_turns(turn_fn: TurnFn, inbox: asyncio.Queue[str]) -> None:
+    """Serialize LLM turns without blocking CTFd polling or swarm cleanup."""
+    while True:
+        message = await inbox.get()
+        try:
+            await turn_fn(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Coordinator turn failed")
+
+
+async def _watch_capacity(deps: CoordinatorDeps, poller: ChallengeState) -> None:
+    """Release a slot only after the swarm task has completed its cleanup."""
+    while True:
+        await deps.capacity_changed.wait()
+        deps.capacity_changed.clear()
+        async with deps.spawn_lock:
+            for name, task in list(deps.swarm_tasks.items()):
+                if not task.done():
+                    continue
+                if task.cancelled() or task.exception():
+                    logger.error(
+                        "Swarm %s did not clean up; keeping its slot: %s",
+                        name,
+                        "cancelled" if task.cancelled() else task.exception(),
+                    )
+                    continue
+                deps.swarm_tasks.pop(name, None)
+                deps.swarms.pop(name, None)
+                deps.coordinator_inbox.put_nowait(
+                    f"SOLVER FINISHED: Swarm for '{name}' completed. Check results or retry."
+                )
+        await _auto_spawn_unsolved(deps, poller, deps.auto_attempted)
+
+
+async def _auto_spawn_one(
+    deps: CoordinatorDeps, challenge_name: str, attempted: set[str] | None = None
+) -> None:
+    """Auto-spawn a pending challenge without retrying finished swarms."""
+    if (
+        challenge_name in deps.solved_challenges
+        or challenge_name in deps.swarms
+        or (attempted is not None and challenge_name in attempted)
+    ):
         return
-    active = sum(1 for t in deps.swarm_tasks.values() if not t.done())
-    if active >= deps.max_concurrent_challenges:
+    if len(deps.swarms) >= deps.max_concurrent_challenges:
         return
     try:
         from backend.agents.coordinator_core import do_spawn_swarm
+
         result = await do_spawn_swarm(deps, challenge_name)
+        if attempted is not None and challenge_name in deps.swarms:
+            attempted.add(challenge_name)
         logger.info(f"Auto-spawn {challenge_name}: {result[:100]}")
     except Exception as e:
         logger.warning(f"Auto-spawn failed for {challenge_name}: {e}")
 
 
-async def _auto_spawn_unsolved(deps: CoordinatorDeps, poller) -> None:
-    """Auto-spawn swarms for all unsolved challenges that don't have active swarms."""
-    unsolved = poller.known_challenges - poller.known_solved
+async def _auto_spawn_unsolved(
+    deps: CoordinatorDeps, poller: ChallengeState, attempted: set[str] | None = None
+) -> None:
+    """Auto-spawn unsolved challenges as capacity becomes available."""
+    unsolved = poller.known_challenges - poller.known_solved - deps.solved_challenges
     for name in sorted(unsolved):
-        await _auto_spawn_one(deps, name)
+        await _auto_spawn_one(deps, name, attempted)
 
 
 async def _start_msg_server(inbox: asyncio.Queue, port: int = 0) -> asyncio.Server | None:
@@ -254,15 +314,21 @@ async def _start_msg_server(inbox: asyncio.Queue, port: int = 0) -> asyncio.Serv
                 try:
                     data = json.loads(body)
                     message = data.get("message", body.decode())
-                except (json.JSONDecodeError, UnicodeDecodeError):
+                except json.JSONDecodeError, UnicodeDecodeError:
                     message = body.decode("utf-8", errors="replace")
 
                 inbox.put_nowait(message)
                 resp = json.dumps({"ok": True, "queued": message[:200]})
-                writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode())
+                writer.write(
+                    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode()
+                )
             else:
-                resp = json.dumps({"error": "POST with JSON body required", "usage": "POST {\"message\": \"...\"}"})
-                writer.write(f"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode())
+                resp = json.dumps(
+                    {"error": "POST with JSON body required", "usage": 'POST {"message": "..."}'}
+                )
+                writer.write(
+                    f"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode()
+                )
 
             await writer.drain()
         except Exception:

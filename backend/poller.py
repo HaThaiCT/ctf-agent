@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from backend.ctfd import CTFdClient
@@ -22,6 +23,7 @@ class CTFdPoller:
 
     ctfd: CTFdClient
     interval_s: float = 5.0
+    on_solved: Callable[[str], None] | None = None
 
     _known_challenges: set[str] = field(default_factory=set)
     _known_solved: set[str] = field(default_factory=set)
@@ -54,14 +56,14 @@ class CTFdPoller:
             self._task.cancel()
             try:
                 await self._task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError, Exception:
                 pass
 
     async def get_event(self, timeout: float = 1.0) -> PollEvent | None:
         """Non-blocking get — returns None if no event within timeout."""
         try:
             return await asyncio.wait_for(self._event_queue.get(), timeout=timeout)
-        except (TimeoutError, asyncio.CancelledError):
+        except TimeoutError, asyncio.CancelledError:
             return None
 
     def drain_events(self) -> list[PollEvent]:
@@ -90,28 +92,33 @@ class CTFdPoller:
 
             # Sanity check: if results look bogus compared to what we know, skip.
             if self._known_challenges and len(current_names) < len(self._known_challenges) // 2:
-                logger.warning(f"Poll returned suspicious data ({len(current_names)} challenges vs {len(self._known_challenges)} known) — skipping")
+                logger.warning(
+                    f"Poll returned suspicious data ({len(current_names)} challenges vs {len(self._known_challenges)} known) — skipping"
+                )
                 return
             # Don't let solved count regress (API might return empty on errors)
             if self._known_solved and not current_solved:
-                logger.warning("Poll returned 0 solved (had %d) — skipping", len(self._known_solved))
+                logger.warning(
+                    "Poll returned 0 solved (had %d) — skipping", len(self._known_solved)
+                )
                 return
 
             # Detect new challenges
             new_challenges = current_names - self._known_challenges
             for name in new_challenges:
                 logger.info("New challenge detected: %s", name)
-                self._event_queue.put_nowait(
-                    PollEvent("new_challenge", name)
-                )
+                self._event_queue.put_nowait(PollEvent("new_challenge", name))
 
             # Detect newly solved
             new_solves = current_solved - self._known_solved
             for name in new_solves:
                 logger.info("Challenge solved: %s", name)
-                self._event_queue.put_nowait(
-                    PollEvent("challenge_solved", name)
-                )
+                if self.on_solved:
+                    try:
+                        self.on_solved(name)
+                    except Exception:
+                        logger.exception("Could not stop swarm for solved challenge %s", name)
+                self._event_queue.put_nowait(PollEvent("challenge_solved", name))
 
             self._known_challenges = current_names
             self._known_solved = current_solved
